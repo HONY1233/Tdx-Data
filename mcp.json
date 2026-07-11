@@ -4,6 +4,11 @@
       "command": "python3",
       "args": ["/workspace/akshare-mcp/server.py"],
       "env": {}
+    },
+    "dbx": {
+      "_comment": "DBX 数据库工作台 MCP —— 让 agent 通过 DBX 查询采集到的 SQLite 数据。需先: npm install -g @dbx-app/mcp-server, 并在 DBX 客户端里配置好指向 data/finance.db 的 SQLite 连接",
+      "command": "npx",
+      "args": ["-y", "@dbx-app/mcp-server"]
     }
   }
 }
