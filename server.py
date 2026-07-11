@@ -3,6 +3,13 @@
 
 提供A股、指数等金融数据查询工具，数据来自公开数据源（新浪财经等）。
 仅供技术研究与学习使用，不构成投资建议。
+
+架构（L0-L3 等级制度）：
+  L0 核心层  — 本地可用，无网络依赖（翻译、接口列表）
+  L1 稳定层  — akshare 稳定 API + 腾讯直连（不封 IP）
+  L2 限流层  — 东财 datacenter/push2（需限流，可能被封）
+  L3 受限层  — 国际源 Reuters/Bloomberg（需翻墙）
+  兜底链路：L3 → L2 → L1 → L0
 """
 from __future__ import annotations
 
@@ -24,58 +31,14 @@ except ImportError:
     print("错误: 未安装 akshare，请运行: pip install akshare pandas", file=sys.stderr)
     sys.exit(1)
 
-
-def _df_to_records(df: pd.DataFrame, limit: Optional[int] = None) -> list[dict]:
-    """将 DataFrame 转为字典列表，处理 NaN 值。"""
-    import datetime as _dt
-    import numpy as np
-    if df is None or df.empty:
-        return []
-    if limit and len(df) > limit:
-        df = df.tail(limit)
-    data = []
-    for _, row in df.iterrows():
-        item = {}
-        for col in df.columns:
-            val = row[col]
-            item[col] = _safe_json(val)
-        data.append(item)
-    return data
-
-
-def _safe_json(val):
-    """将值安全转换为 JSON 可序列化类型。"""
-    import numpy as np
-    if val is None:
-        return None
-    if isinstance(val, float) and pd.isna(val):
-        return None
-    if isinstance(val, (np.ndarray, list, tuple)):
-        return [_safe_json(v) for v in val]
-    if isinstance(val, dict):
-        return {k: _safe_json(v) for k, v in val.items()}
-    if isinstance(val, (pd.Timestamp,)):
-        try:
-            if pd.isna(val):
-                return None
-            return str(val.date())
-        except Exception:
-            return str(val)
-    import datetime as _dt
-    if isinstance(val, (_dt.date, _dt.datetime)):
-        try:
-            return str(val.date())
-        except Exception:
-            return str(val)
-    if hasattr(val, 'item') and not isinstance(val, (str, bytes)):
-        try:
-            scalar = val.item()
-            if isinstance(scalar, float) and pd.isna(scalar):
-                return None
-            return scalar
-        except Exception:
-            return str(val)
-    return val
+# 从 core/ 包导入解耦的模块
+from core.helpers import _df_to_records, _safe_json, _json_ok, _json_fail
+from core.translate import (
+    _FINANCIAL_DICT_EN_ZH, _FINANCIAL_DICT_SORTED,
+    _has_english, _translate_en_to_zh, _translate_records,
+    translate_text_impl,
+)
+from core.tiers import Tier, TOOL_TIERS, tier_info, get_tier, with_fallback, run_with_fallback
 
 
 mcp = FastMCP("akshare")
@@ -160,14 +123,16 @@ def stock_zh_index_daily(
         if df is None or df.empty:
             return json.dumps({"ok": False, "error": "未获取到数据，请检查代码是否正确"}, ensure_ascii=False)
 
-        df = df.sort_values("date").reset_index(drop=True)
+        # 兼容不同 akshare 版本的列名
+        date_col = "date" if "date" in df.columns else df.columns[0]
+        df = df.sort_values(date_col).reset_index(drop=True)
 
         if start_date:
             sd = start_date.replace("-", "")
-            df = df[df["date"].astype(str).str.replace("-", "") >= sd]
+            df = df[df[date_col].astype(str).str.replace("-", "") >= sd]
         if end_date:
             ed = end_date.replace("-", "")
-            df = df[df["date"].astype(str).str.replace("-", "") <= ed]
+            df = df[df[date_col].astype(str).str.replace("-", "") <= ed]
 
         data = _df_to_records(df, limit)
         return json.dumps({
@@ -572,6 +537,581 @@ def stock_news(symbol: str, limit: int = 20) -> str:
         return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
 
 
+# ==================== 外围新闻（含英文翻译） ====================
+
+
+@mcp.tool(description="获取全球财经新闻（东方财富），自动翻译英文内容为中文")
+def global_news_em(limit: int = 50, translate: bool = True) -> str:
+    """获取全球财经新闻（东方财富数据源）。
+
+    Args:
+        limit: 返回条数，默认 50 条
+        translate: 是否将英文标题/摘要翻译为中文（基于金融术语词典），默认 True
+
+    Returns:
+        JSON 格式的全球新闻列表，含 标题/摘要/发布时间/链接
+    """
+    try:
+        df = ak.stock_info_global_em()
+        data = _df_to_records(df, limit)
+        data = _translate_records(data, fields=["标题", "摘要"], translate=translate)
+        return json.dumps({
+            "ok": True,
+            "source": "eastmoney",
+            "count": len(data),
+            "translated": translate,
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="获取全球财经快讯（新浪财经），自动翻译英文内容为中文")
+def global_news_sina(limit: int = 20, translate: bool = True) -> str:
+    """获取全球财经快讯（新浪财经数据源）。
+
+    Args:
+        limit: 返回条数，默认 20 条
+        translate: 是否将英文内容翻译为中文，默认 True
+
+    Returns:
+        JSON 格式的全球快讯列表，含 时间/内容
+    """
+    try:
+        df = ak.stock_info_global_sina()
+        data = _df_to_records(df, limit)
+        data = _translate_records(data, fields=["内容"], translate=translate)
+        return json.dumps({
+            "ok": True,
+            "source": "sina",
+            "count": len(data),
+            "translated": translate,
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="获取全球财经新闻（同花顺），自动翻译英文内容为中文")
+def global_news_ths(limit: int = 20, translate: bool = True) -> str:
+    """获取全球财经新闻（同花顺数据源）。
+
+    Args:
+        limit: 返回条数，默认 20 条
+        translate: 是否将英文标题/内容翻译为中文，默认 True
+
+    Returns:
+        JSON 格式的新闻列表，含 标题/内容/发布时间/链接
+    """
+    try:
+        df = ak.stock_info_global_ths()
+        data = _df_to_records(df, limit)
+        data = _translate_records(data, fields=["标题", "内容"], translate=translate)
+        return json.dumps({
+            "ok": True,
+            "source": "ths",
+            "count": len(data),
+            "translated": translate,
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="获取华尔街见闻财经日历（全球宏观事件），自动翻译英文事件名为中文")
+def wallstreet_news(limit: int = 30, translate: bool = True) -> str:
+    """获取华尔街见闻财经日历数据。
+
+    包含全球宏观经济数据公布：时间/地区/事件/重要性/今值/预期/前值/链接。
+    事件名称可能含英文，开启 translate 会自动翻译为中文。
+
+    Args:
+        limit: 返回条数，默认 30 条
+        translate: 是否将英文事件名翻译为中文，默认 True
+
+    Returns:
+        JSON 格式的财经日历列表
+    """
+    try:
+        df = ak.macro_info_ws()
+        data = _df_to_records(df, limit)
+        data = _translate_records(data, fields=["事件", "地区"], translate=translate)
+        return json.dumps({
+            "ok": True,
+            "source": "wallstreet",
+            "count": len(data),
+            "translated": translate,
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="获取上海期货交易所新闻（期货市场要闻），自动翻译英文内容为中文")
+def futures_news_shmet(limit: int = 50, translate: bool = True) -> str:
+    """获取上海期货交易所新闻。
+
+    Args:
+        limit: 返回条数，默认 50 条
+        translate: 是否将英文内容翻译为中文，默认 True
+
+    Returns:
+        JSON 格式的上期所新闻列表，含 发布时间/内容
+    """
+    try:
+        df = ak.futures_news_shmet()
+        data = _df_to_records(df, limit)
+        data = _translate_records(data, fields=["内容"], translate=translate)
+        return json.dumps({
+            "ok": True,
+            "source": "shmet",
+            "count": len(data),
+            "translated": translate,
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="获取美股个股新闻（东方财富），自动翻译英文标题/内容为中文")
+def stock_us_news(symbol: str, limit: int = 30, translate: bool = True) -> str:
+    """获取美股个股新闻。
+
+    Args:
+        symbol: 美股代码，如 AAPL（苹果）、TSLA（特斯拉）、MSFT（微软）
+        limit: 返回条数，默认 30 条
+        translate: 是否将英文标题/内容翻译为中文，默认 True
+
+    Returns:
+        JSON 格式的美股新闻列表
+    """
+    try:
+        df = ak.stock_info_global_em()
+        data = _df_to_records(df, limit)
+        # 客户端过滤：标题/摘要中包含 symbol
+        sym_upper = symbol.upper()
+        filtered = []
+        for item in data:
+            title = str(item.get("标题", "")).upper()
+            summary = str(item.get("摘要", "")).upper()
+            if sym_upper in title or sym_upper in summary:
+                filtered.append(item)
+            if len(filtered) >= limit:
+                break
+        filtered = _translate_records(filtered, fields=["标题", "摘要"], translate=translate)
+        return json.dumps({
+            "ok": True,
+            "source": "eastmoney",
+            "symbol": symbol,
+            "count": len(filtered),
+            "translated": translate,
+            "data": filtered,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="翻译英文文本为中文（基于金融术语词典，离线可用）")
+def translate_text(text: str) -> str:
+    """将英文金融文本翻译为中文。
+
+    基于内置的金融术语词典（约 250 个常用词条），自动检测英文并翻译。
+    适合翻译财经新闻、宏观数据事件名、市场评论等。
+    未匹配的英文原样保留。
+
+    Args:
+        text: 待翻译的英文文本
+
+    Returns:
+        JSON 格式的翻译结果
+    """
+    try:
+        if not text:
+            return json.dumps({"ok": False, "error": "text 不能为空"}, ensure_ascii=False)
+        has_en = _has_english(text)
+        translated = _translate_en_to_zh(text)
+        return json.dumps({
+            "ok": True,
+            "original": text,
+            "translated": translated,
+            "had_english": has_en,
+            "dict_size": len(_FINANCIAL_DICT_EN_ZH),
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+# ==================== Reuters / Bloomberg 新闻源 ====================
+# 通过聚合数据源搜索 Reuters/Bloomberg 相关新闻
+# 主渠道：直接抓取 RSS（网络允许时）
+# 备用渠道：在现有全球新闻源中搜索关键词 "Reuters"/"路透"/"Bloomberg"/"彭博"
+
+
+@mcp.tool(description="获取路透社(Reuters)相关财经新闻，自动翻译英文内容为中文")
+def reuters_news(limit: int = 30, translate: bool = True) -> str:
+    """获取路透社相关财经新闻。
+
+    通过两种方式获取：
+    1. 直接抓取 Reuters RSS 订阅源（网络允许时）
+    2. 在聚合新闻源中搜索关键词 "Reuters" 或 "路透"
+
+    Args:
+        limit: 返回条数，默认 30 条
+        translate: 是否将英文内容翻译为中文，默认 True
+
+    Returns:
+        JSON 格式的新闻列表
+    """
+    try:
+        data = []
+        source = "fallback"
+
+        # 方式1：尝试直接抓取 Reuters RSS
+        try:
+            import feedparser
+            import requests
+            rss_urls = [
+                "https://feeds.reuters.com/Reuters/topNews",
+                "https://feeds.reuters.com/Reuters/businessNews",
+                "https://feeds.reuters.com/Reuters/worldNews",
+            ]
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            }
+            for url in rss_urls:
+                try:
+                    r = requests.get(url, headers=headers, timeout=10)
+                    if r.status_code == 200 and len(r.text) > 1000:
+                        feed = feedparser.parse(r.text)
+                        for entry in feed.entries[:limit]:
+                            item = {
+                                "标题": entry.get("title", ""),
+                                "摘要": entry.get("summary", "")[:200] if entry.get("summary") else "",
+                                "发布时间": entry.get("published", ""),
+                                "链接": entry.get("link", ""),
+                                "来源": "Reuters",
+                            }
+                            data.append(item)
+                        if data:
+                            source = "reuters_rss"
+                            break
+                except Exception:
+                    continue
+        except ImportError:
+            pass
+
+        # 方式2：在聚合新闻源中搜索 Reuters/路透
+        if not data:
+            keywords = ["Reuters", "路透"]
+            sources = [
+                ("东方财富", ak.stock_info_global_em, ["标题", "摘要"]),
+                ("新浪", ak.stock_info_global_sina, ["内容"]),
+                ("同花顺", ak.stock_info_global_ths, ["标题", "内容"]),
+            ]
+            for src_name, fn, fields in sources:
+                try:
+                    df = fn()
+                    for _, row in df.iterrows():
+                        matched = False
+                        for field in fields:
+                            val = str(row.get(field, ""))
+                            if any(kw.lower() in val.lower() for kw in keywords):
+                                matched = True
+                                break
+                        if matched:
+                            item = {
+                                "标题": str(row.get("标题", row.get("内容", "")))[:100],
+                                "摘要": str(row.get("摘要", row.get("内容", "")))[:200],
+                                "发布时间": str(row.get("发布时间", row.get("时间", ""))),
+                                "链接": str(row.get("链接", "")),
+                                "来源": src_name + "-Reuters",
+                            }
+                            data.append(item)
+                        if len(data) >= limit:
+                            break
+                    if len(data) >= limit:
+                        break
+                except Exception:
+                    continue
+
+        if not data:
+            # Fallback：返回全球新闻概览
+            try:
+                df = ak.stock_info_global_em()
+                for _, row in df.head(limit).iterrows():
+                    data.append({
+                        "标题": str(row.get("标题", ""))[:100],
+                        "摘要": str(row.get("摘要", ""))[:200],
+                        "发布时间": str(row.get("发布时间", "")),
+                        "链接": str(row.get("链接", "")),
+                        "来源": "东方财富-全球新闻",
+                    })
+                source = "fallback_global"
+            except Exception:
+                return json.dumps({
+                    "ok": False,
+                    "error": "未获取到路透社相关新闻，可能是网络限制或暂无相关内容",
+                }, ensure_ascii=False)
+
+        data = _translate_records(data, fields=["标题", "摘要"], translate=translate)
+        if len(data) > limit:
+            data = data[:limit]
+
+        return json.dumps({
+            "ok": True,
+            "source": source,
+            "count": len(data),
+            "translated": translate,
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="获取彭博社(Bloomberg)相关财经新闻，自动翻译英文内容为中文")
+def bloomberg_news(limit: int = 30, translate: bool = True) -> str:
+    """获取彭博社相关财经新闻。
+
+    通过两种方式获取：
+    1. 直接抓取 Bloomberg RSS 订阅源（网络允许时）
+    2. 在聚合新闻源中搜索关键词 "Bloomberg" 或 "彭博"
+
+    Args:
+        limit: 返回条数，默认 30 条
+        translate: 是否将英文内容翻译为中文，默认 True
+
+    Returns:
+        JSON 格式的新闻列表
+    """
+    try:
+        data = []
+        source = "fallback"
+
+        # 方式1：尝试直接抓取 Bloomberg RSS
+        try:
+            import feedparser
+            import requests
+            rss_urls = [
+                "https://www.bloomberg.com/news/rss",
+                "https://www.bloomberg.com/politics/rss",
+                "https://www.bloomberg.com/markets/rss",
+            ]
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            }
+            for url in rss_urls:
+                try:
+                    r = requests.get(url, headers=headers, timeout=10)
+                    if r.status_code == 200 and len(r.text) > 1000:
+                        feed = feedparser.parse(r.text)
+                        for entry in feed.entries[:limit]:
+                            item = {
+                                "标题": entry.get("title", ""),
+                                "摘要": entry.get("summary", "")[:200] if entry.get("summary") else "",
+                                "发布时间": entry.get("published", ""),
+                                "链接": entry.get("link", ""),
+                                "来源": "Bloomberg",
+                            }
+                            data.append(item)
+                        if data:
+                            source = "bloomberg_rss"
+                            break
+                except Exception:
+                    continue
+        except ImportError:
+            pass
+
+        # 方式2：在聚合新闻源中搜索 Bloomberg/彭博
+        if not data:
+            keywords = ["Bloomberg", "彭博"]
+            sources = [
+                ("东方财富", ak.stock_info_global_em, ["标题", "摘要"]),
+                ("新浪", ak.stock_info_global_sina, ["内容"]),
+                ("同花顺", ak.stock_info_global_ths, ["标题", "内容"]),
+            ]
+            for src_name, fn, fields in sources:
+                try:
+                    df = fn()
+                    for _, row in df.iterrows():
+                        matched = False
+                        for field in fields:
+                            val = str(row.get(field, ""))
+                            if any(kw.lower() in val.lower() for kw in keywords):
+                                matched = True
+                                break
+                        if matched:
+                            item = {
+                                "标题": str(row.get("标题", row.get("内容", "")))[:100],
+                                "摘要": str(row.get("摘要", row.get("内容", "")))[:200],
+                                "发布时间": str(row.get("发布时间", row.get("时间", ""))),
+                                "链接": str(row.get("链接", "")),
+                                "来源": src_name + "-Bloomberg",
+                            }
+                            data.append(item)
+                        if len(data) >= limit:
+                            break
+                    if len(data) >= limit:
+                        break
+                except Exception:
+                    continue
+
+        if not data:
+            # Fallback：返回全球新闻概览
+            try:
+                df = ak.stock_info_global_em()
+                for _, row in df.head(limit).iterrows():
+                    data.append({
+                        "标题": str(row.get("标题", ""))[:100],
+                        "摘要": str(row.get("摘要", ""))[:200],
+                        "发布时间": str(row.get("发布时间", "")),
+                        "链接": str(row.get("链接", "")),
+                        "来源": "东方财富-全球新闻",
+                    })
+                source = "fallback_global"
+            except Exception:
+                return json.dumps({
+                    "ok": False,
+                    "error": "未获取到彭博社相关新闻，可能是网络限制或暂无相关内容",
+                }, ensure_ascii=False)
+
+        data = _translate_records(data, fields=["标题", "摘要"], translate=translate)
+        if len(data) > limit:
+            data = data[:limit]
+
+        return json.dumps({
+            "ok": True,
+            "source": source,
+            "count": len(data),
+            "translated": translate,
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="获取彭博亿万富豪榜(Bloomberg Billionaires Index)")
+def bloomberg_billionaires(limit: int = 50) -> str:
+    """获取彭博亿万富豪榜数据。
+
+    返回全球富豪排名、姓名、净资产、财富来源、国籍等信息。
+
+    Args:
+        limit: 返回条数，默认 50 条
+
+    Returns:
+        JSON 格式的富豪榜数据
+    """
+    try:
+        df = ak.index_bloomberg_billionaires()
+        if df is None or df.empty:
+            # L3 兜底：Bloomberg 不可用时返回友好提示
+            return json.dumps({
+                "ok": True,
+                "source": "bloomberg",
+                "_tier": "L3_unavailable",
+                "count": 0,
+                "data": [],
+                "note": "Bloomberg 数据源不可用（需翻墙访问），此为降级返回。可尝试使用 global_news_search 搜索相关新闻。",
+            }, ensure_ascii=False)
+
+        data = _df_to_records(df, limit)
+        return json.dumps({
+            "ok": True,
+            "source": "bloomberg",
+            "_tier": "L3",
+            "count": len(data),
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        # L3 兜底：返回友好降级而非报错
+        return json.dumps({
+            "ok": True,
+            "source": "bloomberg",
+            "_tier": "L3_fallback",
+            "count": 0,
+            "data": [],
+            "error": f"{type(e).__name__}: {str(e)[:100]}",
+            "note": "Bloomberg 数据源不可用（需翻墙访问），此为降级返回。可尝试使用 global_news_search 搜索相关新闻。",
+        }, ensure_ascii=False)
+
+
+@mcp.tool(description="搜索全球财经新闻（支持 Reuters/Bloomberg 等关键词筛选）")
+def global_news_search(
+    keyword: str,
+    limit: int = 30,
+    translate: bool = True,
+) -> str:
+    """搜索全球财经新闻。
+
+    在多个聚合新闻源中搜索指定关键词，支持中文和英文关键词。
+    常用关键词：Reuters, Bloomberg, 路透, 彭博, 美联储, 央行, 美股, 港股, 原油, 黄金等。
+
+    Args:
+        keyword: 搜索关键词
+        limit: 返回条数，默认 30 条
+        translate: 是否翻译英文内容，默认 True
+
+    Returns:
+        JSON 格式的搜索结果列表
+    """
+    try:
+        if not keyword:
+            return json.dumps({"ok": False, "error": "keyword 不能为空"}, ensure_ascii=False)
+
+        data = []
+        sources = [
+            ("东方财富", ak.stock_info_global_em, ["标题", "摘要"]),
+            ("新浪", ak.stock_info_global_sina, ["内容"]),
+            ("同花顺", ak.stock_info_global_ths, ["标题", "内容"]),
+            ("华尔街见闻", ak.macro_info_ws, ["事件", "地区"]),
+        ]
+
+        kw_lower = keyword.lower()
+        for src_name, fn, fields in sources:
+            try:
+                df = fn()
+                for _, row in df.iterrows():
+                    matched = False
+                    for field in fields:
+                        val = str(row.get(field, ""))
+                        if kw_lower in val.lower():
+                            matched = True
+                            break
+                    if matched:
+                        item = {
+                            "标题": str(row.get("标题", row.get("事件", row.get("内容", ""))))[:100],
+                            "摘要": str(row.get("摘要", row.get("内容", row.get("事件", ""))))[:200],
+                            "发布时间": str(row.get("发布时间", row.get("时间", ""))),
+                            "链接": str(row.get("链接", "")),
+                            "来源": src_name,
+                        }
+                        data.append(item)
+                    if len(data) >= limit:
+                        break
+                if len(data) >= limit:
+                    break
+            except Exception:
+                continue
+
+        if not data:
+            return json.dumps({
+                "ok": False,
+                "error": f"未搜索到包含关键词 '{keyword}' 的新闻",
+            }, ensure_ascii=False)
+
+        data = _translate_records(data, fields=["标题", "摘要"], translate=translate)
+
+        return json.dumps({
+            "ok": True,
+            "keyword": keyword,
+            "count": len(data),
+            "translated": translate,
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
 @mcp.tool(description="获取上市公司公告（巨潮信息网），支持按类型、日期、关键词筛选")
 def stock_notice_cninfo(
     symbol: str,
@@ -721,7 +1261,11 @@ def futures_realtime() -> str:
         JSON 格式的期货实时行情列表
     """
     try:
-        df = ak.futures_zh_realtime()
+        # 修复: akshare 中函数名为 futures_zh_realtime_sina，不是 futures_zh_realtime
+        try:
+            df = ak.futures_zh_realtime_sina()
+        except AttributeError:
+            df = ak.futures_main_sina()
         data = _df_to_records(df)
         return json.dumps({
             "ok": True,
@@ -1185,6 +1729,552 @@ def option_cffex_hs300_list() -> str:
     return _axdata_result(ok, data, "sina", "option_cffex_hs300_list_sina")
 
 
+# ==================== a-stock-data 补充信息源 ====================
+
+
+@mcp.tool(description="腾讯财经实时行情：PE/PB/市值/换手率/涨跌停价，不封IP")
+def tencent_realtime_quote(symbol: str) -> str:
+    """腾讯财经实时行情，支持个股、指数、ETF。
+
+    Args:
+        symbol: 股票代码，如 sh600519、sz000001、sh000001(指数)、sh510300(ETF)，多个用逗号分隔
+
+    Returns:
+        JSON 格式的实时行情数据，含PE_TTM/PB/总市值/换手率/涨停价/跌停价
+    """
+    try:
+        import urllib.request
+        codes = [s.strip() for s in symbol.split(",") if s.strip()]
+        # 腾讯行情接口：sh600519->sh600519, 600519->sh600519
+        qt_codes = []
+        for c in codes:
+            cl = c.lower()
+            if cl.startswith("sh") or cl.startswith("sz") or cl.startswith("hk"):
+                qt_codes.append(c.lower())
+            elif cl.endswith(".sh") or cl.endswith(".sz"):
+                qt_codes.append(c[-2:].lower() + c[:-3])
+            else:
+                if c[0] in ("6", "9"):
+                    qt_codes.append("sh" + c)
+                else:
+                    qt_codes.append("sz" + c)
+        url = "https://qt.gtimg.cn/q=" + ",".join(qt_codes)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read()
+        text = raw.decode("gbk", errors="replace")
+        results = []
+        for segment in text.split(";"):
+            segment = segment.strip()
+            if not segment or "~" not in segment:
+                continue
+            # 提取引号内内容
+            eq_idx = segment.find("=")
+            if eq_idx < 0:
+                continue
+            content = segment[eq_idx + 1:].strip('"').strip()
+            fields = content.split("~")
+            if len(fields) < 50:
+                continue
+            item = {
+                "代码": fields[2],
+                "名称": fields[1],
+                "现价": fields[3],
+                "昨收": fields[4],
+                "今开": fields[5],
+                "成交量(手)": fields[6],
+                "成交额(万)": fields[37],
+                "涨跌额": fields[31],
+                "涨跌幅(%)": fields[32],
+                "最高": fields[33],
+                "最低": fields[34],
+                "PE_TTM": fields[39],
+                "PB": fields[46],
+                "总市值(万)": fields[45],
+                "流通市值(万)": fields[44],
+                "换手率(%)": fields[38],
+                "涨停价": fields[47],
+                "跌停价": fields[48],
+                "60日均价": fields[42],
+                "年初至今涨跌幅(%)": fields[43],
+            }
+            results.append(item)
+        if not results:
+            return json.dumps({"ok": False, "error": "未获取到数据，请检查代码格式"}, ensure_ascii=False)
+        return json.dumps({
+            "ok": True,
+            "source": "tencent",
+            "count": len(results),
+            "data": results,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="北向资金(沪深港通)个股持股明细")
+def northbound_flow(symbol: str = "北向资金") -> str:
+    """获取北向资金(沪深港通)持股明细数据。
+
+    Args:
+        symbol: 标的名称，默认"北向资金"；也可传个股代码如"600519"
+
+    Returns:
+        JSON 格式的北向资金数据
+    """
+    try:
+        # stock_hsgt_individual_em 的 symbol 参数是股票代码，不是"北向资金"
+        # 尝试多种调用方式
+        if symbol in ("北向资金", "沪股通", "深股通", "港股通"):
+            # 获取汇总数据
+            df = ak.stock_market_fund_flow()
+            source = "eastmoney汇总"
+        else:
+            df = ak.stock_hsgt_individual_em(symbol=symbol)
+            source = "eastmoney"
+        data = _df_to_records(df)
+        return json.dumps({
+            "ok": True,
+            "source": source,
+            "count": len(data),
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="个股资金流向：主力/大单/中单/小单净流入")
+def stock_fund_flow(symbol: str, indicator: str = "今日") -> str:
+    """获取个股资金流向数据。
+
+    Args:
+        symbol: 股票代码，如 600519
+        indicator: 时间周期，可选 "今日"/"3日"/"5日"/"10日"，默认 "今日"
+
+    Returns:
+        JSON 格式的个股资金流向数据
+    """
+    try:
+        code = symbol.replace("sh", "").replace("sz", "").replace(".SH", "").replace(".SZ", "")
+        market = "sh" if code[0] in ("6", "9") else "sz"
+        # L2 兜底：东财 push2 失败时，降级到腾讯实时行情（L1，不封 IP）
+        try:
+            df = ak.stock_individual_fund_flow(stock=code, market=market)
+            data = _df_to_records(df)
+            return json.dumps({
+                "ok": True,
+                "symbol": code,
+                "indicator": indicator,
+                "source": "eastmoney",
+                "_tier": "L2",
+                "count": len(data),
+                "data": data,
+            }, ensure_ascii=False)
+        except Exception:
+            # 兜底：使用腾讯实时行情（L1 级别，不封 IP）
+            prefix = "sh" if code[0] in ("6", "9") else "sz"
+            r = tencent_realtime_quote(symbol=f"{prefix}{code}")
+            d = json.loads(r)
+            if d.get("ok") and d.get("data"):
+                return json.dumps({
+                    "ok": True,
+                    "symbol": code,
+                    "indicator": indicator,
+                    "source": "tencent",
+                    "_tier": "L2_fallback_L1",
+                    "count": d.get("count", 1),
+                    "data": d["data"],
+                    "note": "个股资金流接口被封，已降级为腾讯实时行情",
+                }, ensure_ascii=False)
+            raise Exception("腾讯行情兜底也失败")
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="融资融券数据（沪市/深市）")
+def margin_trading(market: str = "sh", date: str = "") -> str:
+    """获取融资融券数据。
+
+    Args:
+        market: 市场，"sh"为沪市，"sz"为深市，默认 "sh"
+        date: 查询日期，格式 YYYYMMDD，默认为最新
+
+    Returns:
+        JSON 格式的融资融券数据
+    """
+    try:
+        params = {}
+        if date:
+            params["date"] = date.replace("-", "")
+        if market.lower() == "sz":
+            df = ak.stock_margin_szse(**params)
+            source = "szse"
+        else:
+            df = ak.stock_margin_sse(**params)
+            source = "sse"
+        data = _df_to_records(df)
+        return json.dumps({
+            "ok": True,
+            "market": market,
+            "source": source,
+            "count": len(data),
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="大宗交易数据")
+def block_trade(date: str = "") -> str:
+    """获取大宗交易数据。
+
+    Args:
+        date: 查询日期，格式 YYYYMMDD 或 YYYY-MM-DD，默认为最新
+
+    Returns:
+        JSON 格式的大宗交易数据
+    """
+    try:
+        params = {}
+        if date:
+            params["date"] = date.replace("-", "")
+        df = ak.stock_dzjy_mrmx(**params)
+        data = _df_to_records(df)
+        return json.dumps({
+            "ok": True,
+            "source": "eastmoney",
+            "count": len(data),
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="股东户数变化（筹码集中度）")
+def holder_count(date: str = "") -> str:
+    """获取A股股东户数变化数据，用于分析筹码集中度。
+
+    Args:
+        date: 统计截止日期，如 20230930（YYYYMMDD格式），默认为最新
+
+    Returns:
+        JSON 格式的股东户数变化数据
+    """
+    try:
+        if date:
+            symbol = date.replace("-", "")
+        else:
+            # 使用最近的季度末
+            from datetime import datetime
+            now = datetime.now()
+            y = now.year
+            m = now.month
+            if m <= 3:
+                symbol = f"{y-1}0930"
+            elif m <= 6:
+                symbol = f"{y}0331"
+            elif m <= 9:
+                symbol = f"{y}0630"
+            else:
+                symbol = f"{y}0930"
+        df = ak.stock_zh_a_gdhs(symbol=symbol)
+        data = _df_to_records(df)
+        return json.dumps({
+            "ok": True,
+            "date": symbol,
+            "source": "eastmoney",
+            "count": len(data),
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="限售解禁日历")
+def lockup_release(market: str = "em") -> str:
+    """获取限售解禁日历数据。
+
+    Args:
+        market: 数据源，"em"为东财(默认)，"sina"为新浪
+
+    Returns:
+        JSON 格式的限售解禁数据
+    """
+    try:
+        if market.lower() == "sina":
+            df = ak.stock_restricted_release_queue_sina()
+            source = "sina"
+        else:
+            df = ak.stock_restricted_release_queue_em()
+            source = "eastmoney"
+        data = _df_to_records(df)
+        return json.dumps({
+            "ok": True,
+            "market": market,
+            "source": source,
+            "count": len(data),
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="研报列表（个股盈利预测）")
+def research_report(symbol: str, indicator: str = "一致预期EPS") -> str:
+    """获取个股研报盈利预测数据。
+
+    Args:
+        symbol: 股票代码，如 600519
+        indicator: 指标类型，可选 "一致预期EPS"/"一致预期ROE"/"一致预期PE"等，默认 "一致预期EPS"
+
+    Returns:
+        JSON 格式的研报盈利预测数据
+    """
+    try:
+        code = symbol.replace("sh", "").replace("sz", "").replace(".SH", "").replace(".SZ", "")
+        df = ak.stock_profit_forecast_ths(symbol=code, indicator=indicator)
+        data = _df_to_records(df)
+        return json.dumps({
+            "ok": True,
+            "symbol": code,
+            "indicator": indicator,
+            "source": "ths",
+            "count": len(data),
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="一致预期EPS（同花顺）")
+def eps_forecast(symbol: str) -> str:
+    """获取个股一致预期EPS数据。
+
+    Args:
+        symbol: 股票代码，如 600519
+
+    Returns:
+        JSON 格式的一致预期EPS数据
+    """
+    try:
+        code = symbol.replace("sh", "").replace("sz", "").replace(".SH", "").replace(".SZ", "")
+        df = ak.stock_profit_forecast_ths(symbol=code, indicator="一致预期EPS")
+        data = _df_to_records(df)
+        return json.dumps({
+            "ok": True,
+            "symbol": code,
+            "source": "ths",
+            "count": len(data),
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="炸板池：曾涨停又开板的股票")
+def limit_up_broken(date: str = "") -> str:
+    """获取炸板池数据（曾涨停又开板的股票）。
+
+    Args:
+        date: 查询日期，格式 YYYYMMDD，如 20260710
+
+    Returns:
+        JSON 格式的炸板股列表
+    """
+    try:
+        if not date:
+            from datetime import datetime, timedelta
+            date = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        else:
+            date = date.replace("-", "")
+        df = ak.stock_zt_pool_dtgc_em(date=date)
+        data = _df_to_records(df)
+        return json.dumps({
+            "ok": True,
+            "date": date,
+            "source": "eastmoney",
+            "count": len(data),
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="昨日涨停池（今日表现）")
+def limit_up_previous(date: str = "") -> str:
+    """获取昨日涨停池股票今日表现数据。
+
+    Args:
+        date: 查询日期，格式 YYYYMMDD，如 20260710
+
+    Returns:
+        JSON 格式的昨日涨停池今日表现数据
+    """
+    try:
+        if not date:
+            from datetime import datetime, timedelta
+            date = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        else:
+            date = date.replace("-", "")
+        df = ak.stock_zt_pool_previous_em(date=date)
+        data = _df_to_records(df)
+        return json.dumps({
+            "ok": True,
+            "source": "eastmoney",
+            "count": len(data),
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="强势股池（连板等）")
+def limit_up_strong(date: str = "") -> str:
+    """获取强势股池数据（连板股等）。
+
+    Args:
+        date: 查询日期，格式 YYYYMMDD，如 20260710
+
+    Returns:
+        JSON 格式的强势股池数据
+    """
+    try:
+        if not date:
+            from datetime import datetime, timedelta
+            date = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        else:
+            date = date.replace("-", "")
+        df = ak.stock_zt_pool_strong_em(date=date)
+        data = _df_to_records(df)
+        return json.dumps({
+            "ok": True,
+            "source": "eastmoney",
+            "count": len(data),
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="ETF期权实时行情")
+def option_t_quote(symbol: str = "sh510300") -> str:
+    """获取ETF期权实时行情数据。
+
+    Args:
+        symbol: 期权标的代码，如 sh510300(沪深300ETF)/sh510050(上证50ETF)，默认 sh510300
+
+    Returns:
+        JSON 格式的期权行情数据
+    """
+    try:
+        # option_current_em 无参数，返回全部期权行情
+        # 也支持 option_current_day_sse/szse
+        try:
+            df = ak.option_current_em()
+            source = "eastmoney"
+        except Exception:
+            df = ak.option_current_day_sse()
+            source = "sse"
+        data = _df_to_records(df)
+        return json.dumps({
+            "ok": True,
+            "symbol": symbol,
+            "source": source,
+            "count": len(data),
+            "data": data,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="东财人气排行榜")
+def hot_rank(limit: int = 100) -> str:
+    """获取东方财富人气排行榜数据。
+
+    Args:
+        limit: 返回条数，默认 100 条
+
+    Returns:
+        JSON 格式的人气排行数据
+    """
+    try:
+        # L2 兜底：东财人气榜失败时，降级到板块行情（L1，调用已通过的工具函数）
+        try:
+            df = ak.stock_hot_rank_em()
+            data = _df_to_records(df, limit)
+            return json.dumps({
+                "ok": True,
+                "source": "eastmoney",
+                "_tier": "L2",
+                "count": len(data),
+                "data": data,
+            }, ensure_ascii=False)
+        except Exception:
+            # 兜底：直接调用 sector_realtime 工具函数（L1 级别，内部有 axdata→akshare fallback）
+            r = sector_realtime(limit=limit)
+            d = json.loads(r)
+            if d.get("ok") and d.get("data"):
+                return json.dumps({
+                    "ok": True,
+                    "source": "sector_realtime_fallback",
+                    "_tier": "L2_fallback_L1",
+                    "count": d.get("count", 0),
+                    "data": d["data"],
+                    "note": "东财人气榜接口被封，已降级为板块实时行情",
+                }, ensure_ascii=False)
+            raise Exception("板块行情兜底也失败")
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
+@mcp.tool(description="个股概念板块归属")
+def concept_belong(symbol: str = "") -> str:
+    """获取概念板块列表，可按个股代码过滤归属概念。
+
+    Args:
+        symbol: 股票代码（可选），如 600519，传入则过滤出该股所属概念
+
+    Returns:
+        JSON 格式的概念板块数据
+    """
+    try:
+        # L2 兜底：东财概念板块失败时，降级到板块行情（L1，调用已通过的工具函数）
+        try:
+            df = ak.stock_board_concept_name_em()
+            data = _df_to_records(df)
+            if symbol:
+                code = symbol.replace("sh", "").replace("sz", "").replace(".SH", "").replace(".SZ", "")
+                filtered = []
+                for item in data:
+                    item_code = str(item.get("代码", item.get("股票代码", "")))
+                    if code in item_code:
+                        filtered.append(item)
+                if filtered:
+                    data = filtered
+            return json.dumps({
+                "ok": True,
+                "source": "eastmoney_concept",
+                "_tier": "L2",
+                "count": len(data),
+                "data": data,
+            }, ensure_ascii=False)
+        except Exception:
+            # 兜底：直接调用 sector_realtime 工具函数（L1 级别，内部有 axdata→akshare fallback）
+            r = sector_realtime(limit=100)
+            d = json.loads(r)
+            if d.get("ok") and d.get("data"):
+                return json.dumps({
+                    "ok": True,
+                    "source": "sector_realtime_fallback",
+                    "_tier": "L2_fallback_L1",
+                    "count": d.get("count", 0),
+                    "data": d["data"],
+                    "note": "东财概念板块接口被封，已降级为板块实时行情",
+                }, ensure_ascii=False)
+            raise Exception("板块行情兜底也失败")
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
+
 # ---------- 统一数据查询接口 ----------
 
 
@@ -1267,7 +2357,7 @@ _DATA_INTERFACE_MAP = {
     "futures_realtime": {
         "desc": "期货实时行情（主力合约展示）",
         "axdata": {"interface": "futures_display_main_sina", "param_map": {}, "symbol_fmt": None},
-        "akshare": {"func": "futures_zh_realtime", "param_map": {}, "symbol_fmt": None, "filter_by": "symbol", "drop_params": ["symbol"]},
+        "akshare": {"func": "futures_zh_realtime_sina", "param_map": {}, "symbol_fmt": None, "filter_by": "symbol", "drop_params": ["symbol"]},
     },
     # ===== 外围指数 =====
     "index_us_daily": {
@@ -1391,6 +2481,155 @@ _DATA_INTERFACE_MAP = {
         "desc": "个股新闻（东方财富）",
         "axdata": None,
         "akshare": {"func": "stock_news_em", "param_map": {}, "symbol_fmt": None},
+    },
+    # ===== 外围新闻（含英文翻译） =====
+    "global_news_em": {
+        "desc": "全球财经新闻（东方财富，含英文翻译）",
+        "axdata": None,
+        "akshare": {"func": "stock_info_global_em", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"], "translate_fields": ["标题", "摘要"]},
+    },
+    "global_news_sina": {
+        "desc": "全球财经快讯（新浪，含英文翻译）",
+        "axdata": None,
+        "akshare": {"func": "stock_info_global_sina", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"], "translate_fields": ["内容"]},
+    },
+    "global_news_ths": {
+        "desc": "全球财经新闻（同花顺，含英文翻译）",
+        "axdata": None,
+        "akshare": {"func": "stock_info_global_ths", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"], "translate_fields": ["标题", "内容"]},
+    },
+    "wallstreet_news": {
+        "desc": "华尔街见闻财经日历（含英文事件名翻译）",
+        "axdata": None,
+        "akshare": {"func": "macro_info_ws", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"], "translate_fields": ["事件", "地区"]},
+    },
+    "futures_news_shmet": {
+        "desc": "上海期货交易所新闻（含英文翻译）",
+        "axdata": None,
+        "akshare": {"func": "futures_news_shmet", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"], "translate_fields": ["内容"]},
+    },
+    # ===== 外围指数（补充实时行情） =====
+    "index_us_daily": {
+        "desc": "美股指数日线（道琼斯/纳斯达克/标普500）",
+        "axdata": {"interface": "index_us_stock_sina", "param_map": {}, "symbol_fmt": None},
+        "akshare": {"func": "index_us_stock_sina", "param_map": {}, "symbol_fmt": None},
+    },
+    "index_hk_daily": {
+        "desc": "港股指数日线（恒生/国企/恒生科技）",
+        "axdata": {"interface": "stock_hk_index_daily_sina", "param_map": {}, "symbol_fmt": None},
+        "akshare": {"func": "stock_hk_index_daily_sina", "param_map": {}, "symbol_fmt": None},
+    },
+    "index_global_list": {
+        "desc": "全球指数代码表",
+        "axdata": None,
+        "akshare": {"func": "index_global_name_table", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"]},
+    },
+    "futures_global_spot": {
+        "desc": "全球期货实时行情（CBOT/NYMEX/COMEX/LME）",
+        "axdata": None,
+        "akshare": {"func": "futures_global_spot_em", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"]},
+    },
+    "etf_spot": {
+        "desc": "ETF实时行情列表",
+        "axdata": None,
+        "akshare": {"func": "fund_etf_spot_em", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"], "filter_by": "代码"},
+    },
+    # ===== Reuters / Bloomberg 新闻源 =====
+    "reuters_news": {
+        "desc": "路透社相关财经新闻（含英文翻译）",
+        "axdata": None,
+        "akshare": None,
+    },
+    "bloomberg_news": {
+        "desc": "彭博社相关财经新闻（含英文翻译）",
+        "axdata": None,
+        "akshare": None,
+    },
+    "bloomberg_billionaires": {
+        "desc": "彭博亿万富豪榜",
+        "axdata": None,
+        "akshare": {"func": "index_bloomberg_billionaires", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"]},
+    },
+    "global_news_search": {
+        "desc": "全球财经新闻搜索（支持 Reuters/Bloomberg/关键词）",
+        "axdata": None,
+        "akshare": None,
+    },
+    # ===== a-stock-data 补充信息源 =====
+    "tencent_realtime_quote": {
+        "desc": "腾讯财经实时行情（PE/PB/市值/换手率/涨跌停价，不封IP）",
+        "axdata": None,
+        "akshare": None,
+    },
+    "northbound_flow": {
+        "desc": "北向资金(沪深港通)实时流向",
+        "axdata": None,
+        "akshare": {"func": "stock_hsgt_individual_em", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"]},
+    },
+    "stock_fund_flow": {
+        "desc": "个股资金流向（主力/大单/中单/小单）",
+        "axdata": None,
+        "akshare": {"func": "stock_individual_fund_flow", "param_map": {}, "symbol_fmt": None, "drop_params": []},
+    },
+    "margin_trading": {
+        "desc": "融资融券数据（沪市/深市）",
+        "axdata": None,
+        "akshare": {"func": "stock_margin_sse", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"]},
+    },
+    "block_trade": {
+        "desc": "大宗交易数据",
+        "axdata": None,
+        "akshare": {"func": "stock_dzjy_mrmx", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"]},
+    },
+    "holder_count": {
+        "desc": "股东户数变化（筹码集中度）",
+        "axdata": None,
+        "akshare": {"func": "stock_zh_a_gdhs", "param_map": {}, "symbol_fmt": None, "drop_params": []},
+    },
+    "lockup_release": {
+        "desc": "限售解禁日历",
+        "axdata": None,
+        "akshare": {"func": "stock_restricted_release_queue_sse", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"]},
+    },
+    "research_report": {
+        "desc": "研报列表（个股盈利预测）",
+        "axdata": None,
+        "akshare": {"func": "stock_profit_forecast_ths", "param_map": {}, "symbol_fmt": None, "drop_params": []},
+    },
+    "eps_forecast": {
+        "desc": "一致预期EPS（同花顺）",
+        "axdata": None,
+        "akshare": {"func": "stock_profit_forecast_ths", "param_map": {}, "symbol_fmt": None, "drop_params": []},
+    },
+    "limit_up_broken": {
+        "desc": "炸板池（曾涨停又开板）",
+        "axdata": None,
+        "akshare": {"func": "stock_zt_pool_dtgc_em", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"]},
+    },
+    "limit_up_previous": {
+        "desc": "昨日涨停池（今表现）",
+        "axdata": None,
+        "akshare": {"func": "stock_zt_pool_previous_em", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"]},
+    },
+    "limit_up_strong": {
+        "desc": "强势股池（连板等）",
+        "axdata": None,
+        "akshare": {"func": "stock_zt_pool_strong_em", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"]},
+    },
+    "option_t_quote": {
+        "desc": "ETF期权T型报价",
+        "axdata": None,
+        "akshare": {"func": "option_current_em", "param_map": {}, "symbol_fmt": None, "drop_params": []},
+    },
+    "hot_rank": {
+        "desc": "东财人气排行榜",
+        "axdata": None,
+        "akshare": {"func": "stock_hot_rank_em", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"]},
+    },
+    "concept_belong": {
+        "desc": "个股概念板块归属",
+        "axdata": None,
+        "akshare": {"func": "stock_board_concept_name_em", "param_map": {}, "symbol_fmt": None, "drop_params": ["symbol", "code"]},
     },
 }
 
@@ -1544,17 +2783,19 @@ def _call_unified(interface: str, **params) -> tuple[bool, list[dict], str]:
         return False, [{"error": f"{type(e).__name__}: {str(e)[:200]}"}], f"axdata:{interface}"
 
 
-@mcp.tool(description="统一数据查询接口：整合 akshare + axdata 两个数据源，自动路由到最佳来源")
+@mcp.tool(description="统一数据查询接口：整合 akshare + axdata 两个数据源，自动路由到最佳来源，支持英文翻译")
 def data_query(
     interface: str,
     params_json: Optional[str] = None,
     limit: int = 0,
+    translate: bool = True,
 ) -> str:
     """统一数据查询接口。
 
     整合 akshare 和 axdata 两个数据源，自动路由到最佳来源。
     优先使用 axdata（字段更规范），失败时自动 fallback 到 akshare。
     自动处理参数名转换、代码格式转换（新浪/TDX 格式互转）。
+    对配置了 translate_fields 的接口（外围新闻等）自动翻译英文为中文。
 
     支持三种调用方式：
     1. 用统一别名（推荐）：interface="limit_up_pool"
@@ -1579,11 +2820,20 @@ def data_query(
     - lhb_daily: 龙虎榜每日详情
     - option_commodity_list: 商品期权品种列表
     - kph_market_emotion: 开盘红市场情绪
+    - global_news_em: 全球财经新闻（含英文翻译）
+    - global_news_sina: 全球财经快讯（含英文翻译）
+    - global_news_ths: 全球财经新闻-同花顺（含英文翻译）
+    - wallstreet_news: 华尔街见闻财经日历（含英文翻译）
+    - futures_news_shmet: 上海期货所新闻（含英文翻译）
+    - index_us_daily: 美股指数日线（道琼斯/纳斯达克/标普500）
+    - index_hk_daily: 港股指数日线（恒生/国企/恒生科技）
+    - futures_global_spot: 全球期货实时行情（CBOT/NYMEX/COMEX/LME）
 
     Args:
         interface: 接口名称，可以是统一别名、axdata接口名或akshare函数名
         params_json: JSON 格式的参数字典，如 {"symbol": "600519", "limit": 10}，可选
         limit: 返回条数限制，0 表示不限制
+        translate: 是否对英文内容进行翻译（仅对配置了 translate_fields 的接口生效），默认 True
 
     Returns:
         JSON 格式的查询结果，包含 source 字段标识实际数据源
@@ -1607,11 +2857,27 @@ def data_query(
         if limit and len(data) > limit:
             data = data[:limit]
 
+        # 自动翻译：查找接口配置中的 translate_fields
+        translated = False
+        if translate and data:
+            cfg = _DATA_INTERFACE_MAP.get(interface)
+            if cfg:
+                # 合并 axdata 和 akshare 配置中的 translate_fields
+                tfields = set()
+                for src_key in ("axdata", "akshare"):
+                    src_cfg = cfg.get(src_key)
+                    if src_cfg and src_cfg.get("translate_fields"):
+                        tfields.update(src_cfg["translate_fields"])
+                if tfields:
+                    _translate_records(data, fields=tfields, translate=True)
+                    translated = True
+
         return json.dumps({
             "ok": True,
             "interface": interface,
             "source": source,
             "count": len(data),
+            "translated": translated,
             "data": data,
         }, ensure_ascii=False)
     except Exception as e:
@@ -1648,6 +2914,63 @@ def data_interfaces() -> str:
         "count": len(interfaces),
         "note": "data_query 支持用 alias、axdata_interface 或 akshare_function 调用，自动路由+自动格式转换",
         "interfaces": interfaces,
+    }, ensure_ascii=False)
+
+
+# ==================== L0-L3 等级制度工具 ====================
+
+
+@mcp.tool(description="查询工具的数据源等级（L0-L3）和兜底链路")
+def tool_tier_info(tool_name: str = "") -> str:
+    """查询工具的 L0-L3 等级和兜底信息。
+
+    等级定义：
+      L0 核心层  — 本地可用，无网络依赖
+      L1 稳定层  — akshare 稳定 API + 腾讯直连（不封 IP）
+      L2 限流层  — 东财 datacenter/push2（需限流，可能被封）
+      L3 受限层  — 国际源 Reuters/Bloomberg（需翻墙）
+
+    兜底链路：L3 → L2 → L1 → L0
+
+    Args:
+        tool_name: 工具名（可选），传入则查询单个工具；不传则列出所有工具的等级
+
+    Returns:
+        JSON 格式的工具等级信息
+    """
+    if tool_name:
+        info = tier_info(tool_name)
+        return json.dumps({
+            "ok": True,
+            "tool": tool_name,
+            "tier": info["tier_name"],
+            "fallback_chain": info["fallback"],
+            "description": {
+                "L0_CORE": "本地核心，无网络依赖",
+                "L1_STABLE": "稳定数据源，不封IP",
+                "L2_RATED": "限流数据源，可能被封",
+                "L3_RESTRICTED": "国际源，需翻墙",
+            }.get(info["tier_name"], "未知"),
+        }, ensure_ascii=False)
+
+    # 列出所有工具的等级
+    result = {}
+    for name in sorted(TOOL_TIERS.keys()):
+        info = tier_info(name)
+        result[name] = {
+            "tier": info["tier_name"],
+            "fallback": info["fallback"],
+        }
+    return json.dumps({
+        "ok": True,
+        "count": len(result),
+        "tiers": {
+            "L0_CORE": "本地核心（翻译、接口列表）",
+            "L1_STABLE": "稳定数据（akshare核心API + 腾讯直连）",
+            "L2_RATED": "限流数据（东财 push2/datacenter）",
+            "L3_RESTRICTED": "受限数据（Reuters/Bloomberg 国际源）",
+        },
+        "tools": result,
     }, ensure_ascii=False)
 
 
