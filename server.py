@@ -1651,5 +1651,69 @@ def data_interfaces() -> str:
     }, ensure_ascii=False)
 
 
+def _parse_args():
+    """解析命令行参数。"""
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="AKShare MCP Server - 金融数据 MCP 服务器",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  python server.py                          # stdio 模式（默认，供 IDE 集成）
+  python server.py --transport sse          # SSE 模式，默认 0.0.0.0:8000
+  python server.py --transport sse --port 9000
+  python server.py --transport streamable-http --host 127.0.0.1 --port 8080
+  python server.py --list                   # 列出所有可用工具
+        """,
+    )
+    parser.add_argument(
+        "--transport", "-t",
+        choices=["stdio", "sse", "streamable-http"],
+        default="stdio",
+        help="传输协议：stdio（默认）、sse、streamable-http",
+    )
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="监听地址，默认 0.0.0.0（所有网卡）",
+    )
+    parser.add_argument(
+        "--port", "-p",
+        type=int,
+        default=8000,
+        help="监听端口，默认 8000",
+    )
+    parser.add_argument(
+        "--list", "-l",
+        action="store_true",
+        help="列出所有可用工具后退出",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    mcp.run()
+    args = _parse_args()
+
+    if args.list:
+        import asyncio
+        async def _list():
+            tools = await mcp.list_tools()
+            print(f"=== AKShare MCP Server 共 {len(tools)} 个工具 ===")
+            print()
+            for t in tools:
+                print(f"  {t.name}")
+                if t.description:
+                    print(f"    {t.description[:80]}")
+                print()
+        asyncio.run(_list())
+        sys.exit(0)
+
+    if args.transport == "stdio":
+        mcp.run()
+    else:
+        # SSE 或 streamable-http 模式
+        mcp.run(
+            transport=args.transport,
+            host=args.host,
+            port=args.port,
+        )
